@@ -3,10 +3,13 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: tools/pack_fpga_repro.sh --dest <destination_dir> [--buildid <id>] [--dry-run]
+Usage: tools/pack_fpga_repro.sh --dest <destination_dir> [--dest2 <path>] [--buildid <id>] [--dry-run]
 
 Options:
-  --dest <destination_dir>   Destination directory for tar.gz (required)
+  --dest <destination_dir>   Destination directory for tar.gz (alias for --dest1)
+  --dest1 <path>             Archive destination directory for tar.gz
+  --dest2 <path>             Delivery directory for redcomp.out tarballs
+  --no-dest2                 Disable dest2 delivery
   --buildid <id>             Build ID (default: YYYYMMDD_HHMMSS_<host>_<user>)
   --dry-run                  Print files to collect without packaging
 USAGE
@@ -28,15 +31,29 @@ need_cmd() {
   return 0
 }
 
-DEST_DIR=""
+DEST1_DIR=""
+DEST2_DIR=""
 BUILD_ID=""
 DRY_RUN=false
+DEST2_ENABLED=true
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dest)
-      DEST_DIR="$2"
+      DEST1_DIR="$2"
       shift 2
+      ;;
+    --dest1)
+      DEST1_DIR="$2"
+      shift 2
+      ;;
+    --dest2)
+      DEST2_DIR="$2"
+      shift 2
+      ;;
+    --no-dest2)
+      DEST2_ENABLED=false
+      shift 1
       ;;
     --buildid)
       BUILD_ID="$2"
@@ -58,8 +75,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$DEST_DIR" ]]; then
-  err "--dest is required"
+if [[ -z "$DEST1_DIR" ]]; then
+  err "--dest or --dest1 is required"
   usage
   exit 1
 fi
@@ -99,9 +116,19 @@ if ! need_cmd git; then
   log "git not found; will skip git metadata"
 fi
 
-if [[ ! -d "$DEST_DIR" ]]; then
-  err "Destination directory does not exist: $DEST_DIR"
+if [[ -n "$DEST2_DIR" && "$DEST2_ENABLED" == false ]]; then
+  err "--dest2 cannot be used together with --no-dest2"
   exit 1
+fi
+
+if [[ ! -d "$DEST1_DIR" ]]; then
+  log "Creating DEST1 directory"
+  mkdir -p "$DEST1_DIR"
+fi
+
+if [[ -n "$DEST2_DIR" && "$DEST2_ENABLED" == true && ! -d "$DEST2_DIR" ]]; then
+  log "Creating dest2 directory"
+  mkdir -p "$DEST2_DIR"
 fi
 
 WORK_DIR="$(mktemp -d)"
@@ -337,7 +364,8 @@ if [[ "$DRY_RUN" == false ]]; then
     echo "HOST=$HOSTNAME"
     echo "USER=$USER_NAME"
     echo "FPGA_ROOT=$FPGA_ROOT"
-    echo "DEST=$DEST_DIR"
+    echo "DEST1=DEST1"
+    echo "TAR_NAME=$TAR_NAME"
     echo "COLLECTED_COUNT=$collected_count"
     echo "THIRD_STEP_SYMLINK_COUNT=$third_step_symlink_count"
     echo "THIRD_STEP_COPIED_COUNT=$third_step_copied_count"
@@ -358,14 +386,83 @@ if [[ "$DRY_RUN" == false ]]; then
   fi
 fi
 
-if [[ "$DRY_RUN" == true ]]; then
-  log "Dry run complete. No tarball created."
-  exit 0
+TAR_NAME="fpga_repro_${BUILD_ID}.tar.gz"
+TAR_PATH="$DEST1_DIR/$TAR_NAME"
+
+if [[ "$DRY_RUN" == false ]]; then
+  ( cd "$WORK_DIR" && tar -czf "$TAR_PATH" "repro_${BUILD_ID}" )
+  log "Created tarball: DEST1/$TAR_NAME"
+else
+  log "Dry run: tarball creation skipped"
 fi
 
-TAR_NAME="fpga_repro_${BUILD_ID}.tar.gz"
-TAR_PATH="$DEST_DIR/$TAR_NAME"
+if [[ -n "$DEST2_DIR" && "$DEST2_ENABLED" == true ]]; then
+  log "Step F: deliver redcomp tarballs to dest2"
+  dest2_errors_file="$META_DIR/dest2_errors.txt"
+  dest2_results=()
+  shopt -s nullglob
+  redcomp_tarballs=("$FPGA_ROOT"/redcomp.out/*.tar.gz)
+  shopt -u nullglob
 
-( cd "$WORK_DIR" && tar -czf "$TAR_PATH" "repro_${BUILD_ID}" )
+  if [[ ${#redcomp_tarballs[@]} -eq 0 ]]; then
+    if [[ "$DRY_RUN" == true ]]; then
+      log "No redcomp tarballs found for dest2"
+    else
+      echo "DEST2: no redcomp tarballs found" >> "$MANIFEST_FILE"
+    fi
+  else
+    for tarball in "${redcomp_tarballs[@]}"; do
+      tar_base="$(basename "$tarball")"
+      tar_stem="${tar_base%.tar.gz}"
+      dest2_tar="$DEST2_DIR/$tar_base"
+      dest2_dir="$DEST2_DIR/$tar_stem"
+      dest2_tmp="$DEST2_DIR/.tmp_${BUILD_ID}_${tar_stem}"
 
-log "Created tarball: $TAR_PATH"
+      if [[ "$DRY_RUN" == true ]]; then
+        log "DEST2: copy $tar_base -> dest2, extract to $tar_stem/, remove tar.gz, chmod -R 777"
+        continue
+      fi
+
+      cp -f "$tarball" "$dest2_tar"
+      mkdir -p "$dest2_tmp"
+      if ! tar -xzf "$dest2_tar" -C "$dest2_tmp"; then
+        echo "DEST2: extract failed for $tar_base" >> "$dest2_errors_file"
+        exit 1
+      fi
+      rm -f "$dest2_tar"
+      mv "$dest2_tmp" "$dest2_dir"
+      chmod -R 777 "$dest2_dir"
+
+      dest2_results+=("$tar_base -> ${tar_stem}/ (chmod 777)")
+    done
+  fi
+
+  if [[ "$DRY_RUN" == false ]]; then
+    {
+      echo "DEST2_DIR=$DEST2_DIR"
+      if [[ ${#dest2_results[@]} -gt 0 ]]; then
+        printf '%s\n' "DEST2_DELIVERED:"
+        printf '%s\n' "${dest2_results[@]}"
+      fi
+    } >> "$MANIFEST_FILE"
+  fi
+
+  if [[ "$DRY_RUN" == false ]]; then
+    dest2_readme="$DEST2_DIR/README_DEST2_LINK.txt"
+    {
+      echo "该目录为 FPGA server 投递区，与 DEST1 归档区对应（不暴露归档绝对路径）。"
+      echo "BUILDID: $BUILD_ID"
+      echo "TIME: $TIME_NOW"
+      echo "HOST: $HOSTNAME"
+      echo "USER: $USER_NAME"
+      echo "Delivered tarballs:"
+      if [[ ${#dest2_results[@]} -gt 0 ]]; then
+        printf '%s\n' "${dest2_results[@]}" | sed 's/^/- /'
+      else
+        echo "- (none)"
+      fi
+      echo "Full repro package: $TAR_NAME (stored in DEST1)"
+    } > "$dest2_readme"
+  fi
+  log "Step F: done"
+fi

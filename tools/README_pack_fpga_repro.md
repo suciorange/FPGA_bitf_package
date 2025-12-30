@@ -5,12 +5,15 @@
 ## 用法
 
 ```bash
-tools/pack_fpga_repro.sh --dest <destination_dir> [--buildid <id>] [--dry-run]
+tools/pack_fpga_repro.sh --dest <destination_dir> [--dest2 <path>] [--buildid <id>] [--dry-run]
 ```
 
 ### 参数
 
-- `--dest <destination_dir>`（必填）：输出 `tar.gz` 放置目录。
+- `--dest <destination_dir>`（必填）：输出 `tar.gz` 放置目录（等价于 `--dest1`）。
+- `--dest1 <path>`（可选）：归档目录（优先于 `--dest`）。
+- `--dest2 <path>`（可选）：投递目录（用于投递 redcomp tarball 并解压）。
+- `--no-dest2`（可选）：显式关闭 dest2 投递行为。
 - `--buildid <id>`（可选）：自定义构建 ID。
   - 默认值：`YYYYMMDD_HHMMSS_<host>_<user>`
 - `--dry-run`（可选）：只打印将要收集的文件，不真正打包。
@@ -57,8 +60,35 @@ repro_<buildid>/
 
 ## 输出
 
-- `fpga_repro_<buildid>.tar.gz` 将输出到 `--dest` 指定目录。
-- 完成后会打印最终 tar.gz 路径。
+- `fpga_repro_<buildid>.tar.gz` 将输出到 `--dest1/--dest` 指定目录。
+- 完成后会打印 tar.gz 文件名（不显示 DEST1 真实路径）。
+
+### DEST1 路径隐藏规则
+
+脚本在 stdout、`meta/manifest.txt`、`meta/env.txt` 等对外文本中不会暴露 DEST1 的真实路径，
+统一用 `DEST1` 作为别名显示。归档文件名仍会记录（如 `fpga_repro_<buildid>.tar.gz`）。
+
+### DEST2 投递说明
+
+当提供 `--dest2` 时，脚本会从 `redcomp.out/` 目录下收集 `*.tar.gz`（仅这一层），并执行：
+
+1. 复制到 `dest2` 目录
+2. 解压到子目录 `<tar_basename_without_.tar.gz>/`
+3. 删除 `dest2` 下的 `*.tar.gz`
+4. 对解压目录执行 `chmod -R 777`
+
+脚本会在 dest2 根目录生成 `README_DEST2_LINK.txt`，内容示例：
+
+```
+该目录为 FPGA server 投递区，与 DEST1 归档区对应（不暴露归档绝对路径）。
+BUILDID: 20240819_120000_host_user
+TIME: 20240819_120000
+HOST: host
+USER: user
+Delivered tarballs:
+- redcomp.outputs.20251225_182500.tar.gz -> extracted to redcomp.outputs.20251225_182500/ (chmod 777)
+Full repro package: fpga_repro_20240819_120000_host_user.tar.gz (stored in DEST1)
+```
 
 ## 依赖
 
